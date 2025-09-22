@@ -1,19 +1,17 @@
 import SteamUser from 'steam-user';
 import { ask } from './auth.js';
+import fs from 'node:fs';
+import path from 'node:path';
 
-interface BadgeInfo { appid: number; cards_remaining?: number; }
+interface BadgeInfo { appid: number; cards_remaining?: number | undefined; }
 
 interface DiscoveryOptions {
   apiKey?: string | undefined;
   targetParallel: number; // desired number of simultaneous games
-  heuristicMaxProbe?: number; // max store probes per cycle
-  heuristicConcurrency?: number;
 }
 
 const DEFAULT_OPTIONS: DiscoveryOptions = {
   targetParallel: 20,
-  heuristicMaxProbe: 120,
-  heuristicConcurrency: 6
 };
 
 export class SteamIdlerManager {
@@ -24,6 +22,19 @@ export class SteamIdlerManager {
   private options: DiscoveryOptions;
   private refreshIntervalMs = 30 * 60 * 1000; // 30 minutes
   private intervalHandle?: NodeJS.Timeout;
+  private everRemaining: Set<number> = new Set(); // games that have shown remaining at least once
+  private refreshToken?: string; // store for reconnect
+  private reconnecting: boolean = false;
+  private reconnectAttempts = 0;
+  private maxReconnectAttempts = 10;
+  private connecting: boolean = false; // track active logOn attempt
+  private connectivityMonitor?: NodeJS.Timeout;
+  private storeCategoryCache: Map<number, boolean> = new Map(); // appid -> hasCards
+  private broadMode: boolean = false;
+  private webCookies: string[] = [];
+  private sessionId?: string;
+  private cacheFile = path.resolve(process.cwd(), 'store-category-cache.json');
+  private pendingPostCookieDiscovery: boolean = false;
 
   constructor(client?: any, options?: Partial<DiscoveryOptions>) {
     this.client = client || new SteamUser();
@@ -31,15 +42,115 @@ export class SteamIdlerManager {
   }
 
   async logOnWithRefresh(refreshToken: string): Promise<void> {
+    this.refreshToken = refreshToken;
     return new Promise((resolve, reject) => {
+      this.connecting = true;
+      // Enable built-in auto relogin so we don't spam manual attempts
+      try { if (typeof this.client.setOption === 'function') this.client.setOption('autoRelogin', true); } catch { /* ignore */ }
       this.client.logOn({ refreshToken });
+      this.client.removeAllListeners('webSession');
+      this.client.on('webSession', (sessionId: string, cookies: string[]) => {
+        this.sessionId = sessionId;
+        this.webCookies = cookies || [];
+        console.log('Obtained web session cookies for community badge fetch.');
+        if (this.pendingPostCookieDiscovery) {
+          this.pendingPostCookieDiscovery = false;
+          // If we have not started idling, we will retry full discovery later in start();
+          if (this.running && this.currentIds.size === 0) {
+            this.discoverGames().then(list => {
+              const needed = (this.options.targetParallel||20) - this.currentIds.size;
+              const add = this.chooseNextGames(list, needed);
+              for (const id of add) this.currentIds.add(id);
+              if (add.length) this.applyIdling();
+            }).catch(()=>{});
+          }
+        }
+      });
       this.client.once('loggedOn', () => {
         if (this.client.steamID) this.steamId64 = this.client.steamID.getSteamID64();
         console.log('Logged in as ' + this.steamId64);
+        this.connecting = false;
+        this.reconnectAttempts = 0;
+        // Proactively request web cookies if not yet received
+        try { if (!this.webCookies.length && typeof this.client.webLogOn === 'function') this.client.webLogOn(); } catch { /* ignore */ }
         resolve();
       });
-  this.client.once('error', (err: any) => reject(err));
+      this.client.once('error', (err: any) => reject(err));
     });
+  }
+
+  private async waitForCookies(timeoutMs: number): Promise<void> {
+    if (this.webCookies.length) return;
+    await new Promise<void>(resolve => {
+      const timer = setTimeout(() => resolve(), timeoutMs);
+      const handler = () => { clearTimeout(timer); resolve(); };
+      this.client.once('webSession', handler);
+    });
+  }
+
+  private async fetchCommunityBadges(): Promise<BadgeInfo[]> {
+    if (!this.webCookies.length) return [];
+    const cookiesHeader = this.webCookies.join('; ');
+    const results: BadgeInfo[] = [];
+    let page = 1;
+    let lastCount = 0;
+    while (page <= 10) { // safety page cap
+      const url = `https://steamcommunity.com/my/badges?l=english&p=${page}`; // full HTML page
+      let text: string;
+      try {
+        const resp = await fetch(url, { headers: { 'cookie': cookiesHeader, 'user-agent': 'SteamIdler/1.0' } });
+        if (!resp.ok) break;
+        text = await resp.text();
+      } catch { break; }
+      // Removed HTML debug dump (previously wrote debug-badges-page1.html)
+      // Extract anchors linking to gamecards
+      const anchorRegex = /<a[^>]+href="https:\/\/steamcommunity.com\/id\/[^"]+\/gamecards\/(\d+)\/"[^>]*><\/a>/g;
+      const anchors: { appid: number; index: number }[] = [];
+      let m: RegExpExecArray | null;
+      while ((m = anchorRegex.exec(text)) !== null) {
+        const idStr = m[1];
+        if (!idStr) continue;
+        const appidParsed = parseInt(idStr, 10);
+        if (!isNaN(appidParsed)) anchors.push({ appid: appidParsed, index: m.index });
+      }
+      if (!anchors.length) break;
+      for (let i = 0; i < anchors.length; i++) {
+        const anchor = anchors[i];
+        if (!anchor) continue;
+        const appid = anchor.appid;
+        const index = anchor.index;
+        const nextAnchor = i + 1 < anchors.length ? anchors[i+1] : undefined;
+        const end = nextAnchor ? nextAnchor.index : index + 4000;
+        const slice = text.slice(index, Math.min(end, index + 8000));
+        let remaining: number | undefined;
+        if (/No card drops remaining/i.test(slice)) {
+          remaining = 0;
+        } else {
+          const direct = /(\d+)\s+card drops? remaining/i.exec(slice);
+          if (direct && direct[1]) {
+            const v = parseInt(direct[1], 10); if (!isNaN(v)) remaining = v;
+          } else {
+            const earned = /Card drops earned:\s*(\d+)/i.exec(slice);
+            const received = /Card drops received:\s*(\d+)/i.exec(slice);
+            if (earned && received && earned[1] && received[1]) {
+              const e = parseInt(earned[1],10); const r = parseInt(received[1],10);
+              if (!isNaN(e) && !isNaN(r) && e >= r) {
+                const diff = e - r; remaining = diff > 0 ? diff : 0;
+              }
+            }
+          }
+        }
+        results.push({ appid, cards_remaining: remaining });
+      }
+      if (results.length === lastCount) break; // no new entries added
+      lastCount = results.length;
+      page++;
+    }
+    // Basic summary (debug HTML dump removed)
+    const pos = results.filter(r => typeof r.cards_remaining === 'number' && r.cards_remaining! > 0).length;
+    const zero = results.filter(r => r.cards_remaining === 0).length;
+    console.log(`Community parse summary: totalBadges=${results.length} withRemaining=${pos} zeroRemaining=${zero}`);
+    return results;
   }
 
   private async fetchBadges(apiKey: string): Promise<BadgeInfo[]> {
@@ -64,39 +175,63 @@ export class SteamIdlerManager {
     return games;
   }
 
-  private async heuristicUnplayedCardGames(apiKey: string, minNeeded: number): Promise<number[]> {
+  private async scanAllCardCapable(apiKey: string, limitNeeded: number): Promise<number[]> {
     const owned = await this.fetchOwned(apiKey);
-    const neverPlayed = owned.filter(g => g.playtime_forever === 0 && typeof g.appid === 'number');
-    if (neverPlayed.length === 0) return [];
-    const found: number[] = [];
-    const concurrency = this.options.heuristicConcurrency || 5;
-    const maxProbe = this.options.heuristicMaxProbe || 120;
-    const subset = neverPlayed.slice(0, maxProbe);
-    let idx = 0;
-    async function probe(appid: number) {
-      const url = `https://store.steampowered.com/api/appdetails?appids=${appid}&filters=categories`;
+    if (!owned.length) return [];
+    // attempt to load cache once per run
+    if (this.storeCategoryCache.size === 0 && fs.existsSync(this.cacheFile)) {
       try {
-        const r = await fetch(url, { headers: { 'user-agent': 'SteamIdler/1.0' } });
-        if (!r.ok) return;
-        const j = await r.json();
-        const entry = j?.[appid];
-        if (entry && entry.success && entry.data && Array.isArray(entry.data.categories)) {
-          if (entry.data.categories.some((c: any) => c && c.id === 29)) {
-            found.push(appid);
+        const raw = JSON.parse(fs.readFileSync(this.cacheFile,'utf-8'));
+        if (raw && typeof raw === 'object') {
+          for (const [k,v] of Object.entries(raw)) {
+            const idNum = parseInt(k,10); if (!isNaN(idNum)) this.storeCategoryCache.set(idNum, !!v);
           }
+          console.log(`Loaded store category cache entries: ${this.storeCategoryCache.size}`);
         }
       } catch { /* ignore */ }
     }
+    const never = owned.filter(g => g.playtime_forever === 0);
+    const low = owned.filter(g => g.playtime_forever > 0 && g.playtime_forever < 30);
+    const rest = owned.filter(g => g.playtime_forever >= 30);
+    const ordered = [...never, ...low, ...rest];
+  const concurrency = 6;
+  const overallCap = 1200 * 2;
+    const found: number[] = [];
+    let idx = 0;
+    const cache = this.storeCategoryCache;
+    async function probe(appid: number) {
+      if (cache.has(appid)) { if (cache.get(appid)) found.push(appid); return; }
+      const url = `https://store.steampowered.com/api/appdetails?appids=${appid}&filters=categories`;
+      try {
+        const r = await fetch(url, { headers: { 'user-agent': 'SteamIdler/1.0' } });
+        if (!r.ok) { cache.set(appid, false); return; }
+        const j = await r.json();
+        const entry = j?.[appid];
+        if (entry && entry.success && entry.data && Array.isArray(entry.data.categories)) {
+          const hasCards = entry.data.categories.some((c: any) => c && c.id === 29);
+          cache.set(appid, !!hasCards);
+          if (hasCards) found.push(appid);
+        } else {
+          cache.set(appid, false);
+        }
+      } catch { cache.set(appid, false); }
+    }
     async function runBatch(): Promise<void> {
       const batch: Promise<void>[] = [];
-      for (let i = 0; i < concurrency && idx < subset.length; i++, idx++) {
-        batch.push(probe(subset[idx].appid));
+      for (let i = 0; i < concurrency && idx < ordered.length && idx < overallCap; i++, idx++) {
+        batch.push(probe(ordered[idx].appid));
       }
       if (!batch.length) return;
       await Promise.all(batch);
-      if (idx < subset.length && found.length < minNeeded) await runBatch();
+      if (found.length < limitNeeded && idx < ordered.length && idx < overallCap) await runBatch();
     }
     await runBatch();
+    // persist cache after scan
+    try {
+      const obj: Record<number, boolean> = {} as any;
+      for (const [id,val] of cache.entries()) obj[id] = val;
+      fs.writeFileSync(this.cacheFile, JSON.stringify(obj));
+    } catch { /* ignore */ }
     return found;
   }
 
@@ -116,18 +251,54 @@ export class SteamIdlerManager {
     let direct: number[] = [];
     if (apiKey) {
       try {
-        const badges = await this.fetchBadges(apiKey);
-        const withRemaining = badges.filter(b => (b.cards_remaining || 0) > 0).map(b => b.appid);
-        console.log(`Badges with remaining: ${withRemaining.length}`);
-        direct = withRemaining;
-        if (direct.length < this.options.targetParallel) {
-          console.log('Attempting heuristic to reach target parallel games...');
-          const need = this.options.targetParallel - direct.length;
-          const heur = await this.heuristicUnplayedCardGames(apiKey, need);
-          // merge keeping order: direct first
-          const merged = [...direct, ...heur.filter(id => !direct.includes(id))];
-          direct = merged;
-          console.log(`Heuristic contributed: ${heur.length}, total candidates now ${direct.length}`);
+        let badges = await this.fetchBadges(apiKey);
+        // If API badges show no remaining fields, attempt community badge scrape for accurate remaining counts
+        const apiRemainingCount = badges.filter(b => {
+          const anyRem = (b as any).cards_remaining ?? (b as any).card_drop_remaining ?? (b as any).card_drop_count;
+          return typeof anyRem === 'number' && anyRem > 0;
+        }).length;
+        if (apiRemainingCount === 0) {
+          if (this.webCookies.length) {
+            console.log('Attempting community badge remaining detection via steamcommunity AJAX...');
+            const communityBadges = await this.fetchCommunityBadges();
+            if (communityBadges.length) {
+              // Merge community remaining info onto API badges where possible
+              const map = new Map<number, BadgeInfo>();
+              for (const b of badges) map.set(b.appid, b);
+              for (const cb of communityBadges) {
+                const existing = map.get(cb.appid) || { appid: cb.appid } as any;
+                if (typeof cb.cards_remaining === 'number') (existing as any).cards_remaining = cb.cards_remaining;
+                map.set(cb.appid, existing as any);
+              }
+              badges = Array.from(map.values());
+              console.log(`Community badge scan merged. Badges now ${badges.length}`);
+            } else {
+              console.log('Community badge scan returned no data.');
+            }
+          } else {
+            console.log('No web cookies yet; deferring community badge scan until cookies available.');
+            this.pendingPostCookieDiscovery = true;
+          }
+        }
+        const withRemainingDetailed = badges.filter(b => {
+          const anyRem = (b as any).cards_remaining ?? (b as any).card_drop_remaining ?? (b as any).card_drop_count;
+          return typeof anyRem === 'number' && anyRem > 0;
+        }).map(b => ({ appid: b.appid, remaining: (b as any).cards_remaining ?? (b as any).card_drop_remaining ?? (b as any).card_drop_count }));
+        withRemainingDetailed.sort((a,b) => (b.remaining||0) - (a.remaining||0));
+        direct = withRemainingDetailed.map(x => x.appid);
+        console.log(`Badges with remaining (any field): ${withRemainingDetailed.length}`);
+        if (direct.length === 0) {
+          if (!this.broadMode) {
+            this.broadMode = true;
+            console.log('No remaining drops detected in badges: broad card-capable scan mode ENABLED.');
+          }
+        }
+        if (direct.length < this.options.targetParallel && this.broadMode) {
+          const stillNeed = this.options.targetParallel - direct.length;
+          console.log(`Broad mode full library scan for additional ${stillNeed} candidates...`);
+          const extra = await this.scanAllCardCapable(apiKey, stillNeed);
+          for (const id of extra) if (!direct.includes(id)) direct.push(id);
+          console.log(`Broad mode added ${extra.length}; total candidates now ${direct.length}`);
         }
       } catch (err) {
         console.log('Discovery error (badges/heuristic):', err instanceof Error ? err.message : err);
@@ -152,20 +323,21 @@ export class SteamIdlerManager {
       const badges = await this.fetchBadges(this.options.apiKey);
       const remainingSet = new Set<number>();
       for (const b of badges) {
-        if ((b.cards_remaining || 0) > 0) remainingSet.add(b.appid);
+        const remRaw = (b as any).cards_remaining ?? (b as any).card_drop_remaining ?? (b as any).card_drop_count;
+        if (typeof remRaw === 'number' && remRaw > 0) {
+          remainingSet.add(b.appid);
+          this.everRemaining.add(b.appid);
+        }
       }
-      // Remove games no longer in remaining set (completed drops) IF they ever had remaining
+      // Only remove games that previously had remaining and now disappeared
       const before = this.currentIds.size;
       for (const id of Array.from(this.currentIds)) {
-        // If a game previously had remaining but now not in remainingSet, consider it complete
-        if (!remainingSet.has(id)) {
+        if (this.everRemaining.has(id) && !remainingSet.has(id)) {
           this.currentIds.delete(id);
         }
       }
       const after = this.currentIds.size;
-      if (after !== before) {
-        console.log(`Completed games removed: ${before - after}`);
-      }
+      if (after !== before) console.log(`Completed games removed: ${before - after}`);
       // Top up to targetParallel
       if (this.currentIds.size < (this.options.targetParallel || 20)) {
         console.log('Topping up game list after removals...');
@@ -186,11 +358,43 @@ export class SteamIdlerManager {
       console.log('--- Periodic badge re-check ---');
       this.refreshBadgeStatus();
     }, this.refreshIntervalMs);
+    // Setup disconnect handling once
+    this.client.removeAllListeners('disconnected');
+    this.client.on('disconnected', (eresult: any, msg: any) => {
+      console.log('Disconnected from Steam (autoRelogin active). EResult:', eresult, msg || '');
+      this.connecting = false;
+      // Let autoRelogin handle reconnect; fallback timer if still offline later
+      setTimeout(() => {
+        if (!this.client.steamID && !this.connecting) {
+          console.log('Still disconnected, attempting single manual reconnect...');
+          this.manualReconnect();
+        }
+      }, 15000);
+    });
+    this.client.removeAllListeners('error');
+    this.client.on('error', (err: any) => {
+      console.log('Client error:', err?.message || err);
+      this.connecting = false;
+    });
+
+    if (this.connectivityMonitor) clearInterval(this.connectivityMonitor);
+    // Lightweight 10s monitor to ensure we always try to restore idling after network returns
+    this.connectivityMonitor = setInterval(() => {
+      const connected = !!this.client.steamID;
+      if (!connected) {
+        if (!this.connecting) {
+          // attempt a quiet manual reconnect every 10s if offline
+          this.manualReconnect();
+        }
+      }
+    }, 10000);
   }
 
   async start(): Promise<void> {
     if (this.running) return;
     this.running = true;
+    // wait briefly for cookies to improve likelihood we can do community scan first pass
+    await this.waitForCookies(4000);
     const candidates = await this.discoverGames();
     if (!candidates.length) {
       console.log('No candidates discovered. Exiting idler.');
@@ -207,5 +411,35 @@ export class SteamIdlerManager {
     if (this.intervalHandle) clearInterval(this.intervalHandle);
     this.currentIds.clear();
     this.client.gamesPlayed([]);
+  }
+
+  // Manual fallback if autoRelogin fails silently
+  private manualReconnect() {
+    if (!this.refreshToken) return;
+    if (this.connecting) return;
+    if ((this.client as any)._loggingOn) return; // internal guard
+    try {
+      this.connecting = true;
+      this.client.logOn({ refreshToken: this.refreshToken });
+      this.client.once('loggedOn', () => {
+        this.connecting = false;
+        this.reconnectAttempts = 0;
+        if (this.client.steamID) this.steamId64 = this.client.steamID.getSteamID64();
+        console.log('Manual reconnect succeeded. Restoring idling list...');
+        this.applyIdling();
+      });
+      this.client.once('error', () => {
+        this.connecting = false;
+        // We'll allow next periodic check to try again, not tight loop
+      });
+    } catch (e: any) {
+      const msg = e?.message || '';
+      if (msg.includes('Already attempting')) {
+        this.connecting = true; // another attempt is in progress
+      } else {
+        console.log('Manual reconnect immediate error:', msg);
+        this.connecting = false;
+      }
+    }
   }
 }
