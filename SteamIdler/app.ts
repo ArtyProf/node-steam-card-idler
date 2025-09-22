@@ -6,8 +6,12 @@ async function main() {
     const username = await ask('Steam Username: ');
     const password = await ask('Steam Password: ');
     const refreshToken = await steamLogin(username, password);
-    const apiKeyInput = process.env.STEAM_API_KEY || await ask('Enter Steam Web API Key (optional, press Enter to skip): ');
-    const apiKey = apiKeyInput && apiKeyInput.trim() !== '' ? apiKeyInput.trim() : undefined;
+    const apiKeyRaw = process.env.STEAM_API_KEY || await ask('Enter Steam Web API Key (required): ');
+    const apiKey = apiKeyRaw?.trim();
+    if (!apiKey) {
+      console.error('STEAM_API_KEY is required. Set env var STEAM_API_KEY or provide it when prompted.');
+      process.exit(1);
+    }
     const idler = new SteamIdlerManager(undefined, { apiKey, targetParallel: 20 });
     await idler.logOnWithRefresh(refreshToken!);
     await idler.start();
