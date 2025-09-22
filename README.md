@@ -22,7 +22,7 @@ Dev:
 
 ## Installation
 ```bash
-git clone <this-repo-url>
+git clone https://github.com/ArtyProf/node-steam-card-idler.git
 cd SteamIdler
 npm install
 npm run build
