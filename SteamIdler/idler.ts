@@ -3,7 +3,16 @@ import { ask } from './auth.js';
 import fs from 'node:fs';
 import path from 'node:path';
 
+// Timestamp all logs with [HH:MM:SS]
+const __origLog = console.log.bind(console);
+console.log = (...args: any[]) => {
+  const d = new Date();
+  const ts = d.toTimeString().split(' ')[0];
+  __origLog(`[${ts}]`, ...args);
+};
+
 interface BadgeInfo { appid: number; cards_remaining?: number | undefined; }
+interface CommunityBadgeInfo extends BadgeInfo { hours_on_record?: number | undefined; }
 
 interface DiscoveryOptions {
   apiKey?: string | undefined;
@@ -20,7 +29,7 @@ export class SteamIdlerManager {
   private running: boolean = false;
   private currentIds: Set<number> = new Set();
   private options: DiscoveryOptions;
-  private refreshIntervalMs = 30 * 60 * 1000; // 30 minutes
+  private refreshIntervalMs = 20 * 60 * 1000; // 20 minutes (was 30)
   private intervalHandle?: NodeJS.Timeout;
   private everRemaining: Set<number> = new Set(); // games that have shown remaining at least once
   private refreshToken?: string; // store for reconnect
@@ -35,6 +44,7 @@ export class SteamIdlerManager {
   private sessionId?: string;
   private cacheFile = path.resolve(process.cwd(), 'store-category-cache.json');
   private pendingPostCookieDiscovery: boolean = false;
+  private restartMonitor?: NodeJS.Timeout; // unused now
 
   constructor(client?: any, options?: Partial<DiscoveryOptions>) {
     this.client = client || new SteamUser();
@@ -88,10 +98,10 @@ export class SteamIdlerManager {
     });
   }
 
-  private async fetchCommunityBadges(): Promise<BadgeInfo[]> {
+  private async fetchCommunityBadges(): Promise<CommunityBadgeInfo[]> {
     if (!this.webCookies.length) return [];
     const cookiesHeader = this.webCookies.join('; ');
-    const results: BadgeInfo[] = [];
+  const results: CommunityBadgeInfo[] = [];
     let page = 1;
     let lastCount = 0;
     while (page <= 10) { // safety page cap
@@ -122,7 +132,8 @@ export class SteamIdlerManager {
         const nextAnchor = i + 1 < anchors.length ? anchors[i+1] : undefined;
         const end = nextAnchor ? nextAnchor.index : index + 4000;
         const slice = text.slice(index, Math.min(end, index + 8000));
-        let remaining: number | undefined;
+  let remaining: number | undefined;
+  let hours: number | undefined;
         if (/No card drops remaining/i.test(slice)) {
           remaining = 0;
         } else {
@@ -140,7 +151,12 @@ export class SteamIdlerManager {
             }
           }
         }
-        results.push({ appid, cards_remaining: remaining });
+        const hoursMatch = /([0-9]+(?:\.[0-9]+)?)\s*hrs?\s+on\s+record/i.exec(slice);
+        if (hoursMatch && hoursMatch[1]) {
+          const hv = parseFloat(hoursMatch[1]);
+          if (!isNaN(hv)) hours = hv;
+        }
+        results.push({ appid, cards_remaining: remaining, hours_on_record: hours });
       }
       if (results.length === lastCount) break; // no new entries added
       lastCount = results.length;
@@ -149,7 +165,8 @@ export class SteamIdlerManager {
     // Basic summary (debug HTML dump removed)
     const pos = results.filter(r => typeof r.cards_remaining === 'number' && r.cards_remaining! > 0).length;
     const zero = results.filter(r => r.cards_remaining === 0).length;
-    console.log(`Community parse summary: totalBadges=${results.length} withRemaining=${pos} zeroRemaining=${zero}`);
+    const hoursTagged = results.filter(r => typeof r.hours_on_record === 'number').length;
+    console.log(`Community parse summary: totalBadges=${results.length} withRemaining=${pos} zeroRemaining=${zero} hoursTagged=${hoursTagged}`);
     return results;
   }
 
@@ -268,6 +285,7 @@ export class SteamIdlerManager {
               for (const cb of communityBadges) {
                 const existing = map.get(cb.appid) || { appid: cb.appid } as any;
                 if (typeof cb.cards_remaining === 'number') (existing as any).cards_remaining = cb.cards_remaining;
+                if (typeof (cb as any).hours_on_record === 'number') (existing as any).hours_on_record = (cb as any).hours_on_record;
                 map.set(cb.appid, existing as any);
               }
               badges = Array.from(map.values());
@@ -283,10 +301,28 @@ export class SteamIdlerManager {
         const withRemainingDetailed = badges.filter(b => {
           const anyRem = (b as any).cards_remaining ?? (b as any).card_drop_remaining ?? (b as any).card_drop_count;
           return typeof anyRem === 'number' && anyRem > 0;
-        }).map(b => ({ appid: b.appid, remaining: (b as any).cards_remaining ?? (b as any).card_drop_remaining ?? (b as any).card_drop_count }));
-        withRemainingDetailed.sort((a,b) => (b.remaining||0) - (a.remaining||0));
+        }).map(b => ({
+          appid: b.appid,
+          remaining: (b as any).cards_remaining ?? (b as any).card_drop_remaining ?? (b as any).card_drop_count,
+          hours: (b as any).hours_on_record
+        }));
+        // Sort: highest hours_on_record first, then remaining drops desc, then appid
+        withRemainingDetailed.sort((a,b) => {
+          const hA = typeof a.hours === 'number' ? a.hours : -1;
+          const hB = typeof b.hours === 'number' ? b.hours : -1;
+          if (hB !== hA) return hB - hA;
+          const rA = a.remaining || 0;
+          const rB = b.remaining || 0;
+          if (rB !== rA) return rB - rA;
+          return a.appid - b.appid;
+        });
         direct = withRemainingDetailed.map(x => x.appid);
-        console.log(`Badges with remaining (any field): ${withRemainingDetailed.length}`);
+        if (withRemainingDetailed.length) {
+          const topPreview = withRemainingDetailed.slice(0,5).map(x => `${x.appid}:${x.hours??'?' }h rem=${x.remaining}`).join(' | ');
+          console.log(`Badges with remaining: ${withRemainingDetailed.length}. Top (hours-first): ${topPreview}`);
+        } else {
+          console.log('Badges with remaining: 0');
+        }
         if (direct.length === 0) {
           if (!this.broadMode) {
             this.broadMode = true;
@@ -317,10 +353,46 @@ export class SteamIdlerManager {
     console.log('Now idling:', list.join(', '));
   }
 
+  // (Removed legacy playtime & baseline persistence logic)
+
+  private async scheduleCommunityHoursRestarts(providedBadges?: CommunityBadgeInfo[]) {
+    if (!this.webCookies.length) return;
+    const threshold = 2; // absolute hours_on_record > 2 triggers restart every recheck
+    let badges: CommunityBadgeInfo[] = providedBadges || [];
+    if (!badges.length) {
+      try { badges = await this.fetchCommunityBadges(); } catch { return; }
+    }
+    if (!badges.length) return;
+    const restartIds: number[] = [];
+    for (const b of badges) {
+      if (typeof b.hours_on_record === 'number' && b.hours_on_record > threshold && this.currentIds.has(b.appid)) restartIds.push(b.appid);
+    }
+    if (!restartIds.length) {
+      console.log('No restart candidates (no game >2h).');
+      return;
+    }
+    const fullList = Array.from(this.currentIds.values()).slice(0,32);
+    const without = fullList.filter(id => !restartIds.includes(id));
+    console.log(`Restarting (hours>2) ${restartIds.length} games: ${restartIds.join(', ')}`);
+    try { this.client.gamesPlayed(without); } catch { /* ignore */ }
+    setTimeout(() => {
+      try {
+        this.client.gamesPlayed(fullList);
+        console.log('Restart cycle complete for:', restartIds.join(', '));
+      } catch { /* ignore */ }
+    }, 3000);
+  }
+
+
   private async refreshBadgeStatus() {
     if (!this.options.apiKey || !this.steamId64) return;
     try {
       const badges = await this.fetchBadges(this.options.apiKey);
+      // Fetch community badges once for both remaining parsing (already integrated earlier) and restart evaluation
+      let communityBadges: CommunityBadgeInfo[] = [];
+      if (this.webCookies.length) {
+        try { communityBadges = await this.fetchCommunityBadges(); } catch { /* ignore */ }
+      }
       const remainingSet = new Set<number>();
       for (const b of badges) {
         const remRaw = (b as any).cards_remaining ?? (b as any).card_drop_remaining ?? (b as any).card_drop_count;
@@ -345,8 +417,11 @@ export class SteamIdlerManager {
         const needed = (this.options.targetParallel || 20) - this.currentIds.size;
         const chosen = this.chooseNextGames(newlyDiscovered, needed);
         for (const id of chosen) this.currentIds.add(id);
+  // Start times persistence removed (using playtime baselines instead)
       }
       this.applyIdling();
+  // Restart any game whose community badge hours exceed 2h
+      await this.scheduleCommunityHoursRestarts(communityBadges);
     } catch (e) {
       console.log('Refresh badge status error:', e instanceof Error ? e.message : e);
     }
@@ -358,6 +433,9 @@ export class SteamIdlerManager {
       console.log('--- Periodic badge re-check ---');
       this.refreshBadgeStatus();
     }, this.refreshIntervalMs);
+    // Separate restart monitor (every 10 minutes) to catch long sessions even if badge fetch fails
+    if (this.restartMonitor) clearInterval(this.restartMonitor);
+    // (Removed separate elapsed-time restart monitor; playtime restarts happen during refresh or explicit call.)
     // Setup disconnect handling once
     this.client.removeAllListeners('disconnected');
     this.client.on('disconnected', (eresult: any, msg: any) => {
@@ -394,6 +472,7 @@ export class SteamIdlerManager {
     if (this.running) return;
     this.running = true;
     // wait briefly for cookies to improve likelihood we can do community scan first pass
+  // (baseline persistence removed)
     await this.waitForCookies(4000);
     const candidates = await this.discoverGames();
     if (!candidates.length) {
@@ -402,6 +481,7 @@ export class SteamIdlerManager {
     }
     const initial = this.chooseNextGames(candidates, this.options.targetParallel || 20);
     for (const id of initial) this.currentIds.add(id);
+    // (No baseline initialization needed)
     this.applyIdling();
     this.startLoop();
   }
@@ -411,6 +491,7 @@ export class SteamIdlerManager {
     if (this.intervalHandle) clearInterval(this.intervalHandle);
     this.currentIds.clear();
     this.client.gamesPlayed([]);
+    if (this.restartMonitor) clearInterval(this.restartMonitor);
   }
 
   // Manual fallback if autoRelogin fails silently
@@ -419,7 +500,6 @@ export class SteamIdlerManager {
     if (this.connecting) return;
     if ((this.client as any)._loggingOn) return; // internal guard
     try {
-      this.connecting = true;
       this.client.logOn({ refreshToken: this.refreshToken });
       this.client.once('loggedOn', () => {
         this.connecting = false;
@@ -427,10 +507,7 @@ export class SteamIdlerManager {
         if (this.client.steamID) this.steamId64 = this.client.steamID.getSteamID64();
         console.log('Manual reconnect succeeded. Restoring idling list...');
         this.applyIdling();
-      });
-      this.client.once('error', () => {
-        this.connecting = false;
-        // We'll allow next periodic check to try again, not tight loop
+        // Baselines remain; playtime delta continues accumulating.
       });
     } catch (e: any) {
       const msg = e?.message || '';
